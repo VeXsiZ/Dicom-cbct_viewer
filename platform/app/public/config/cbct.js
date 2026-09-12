@@ -42,6 +42,7 @@
   }
 
   const STORAGE_KEY = 'cbct-viewer:quality';
+  const PRECISION_KEY = 'cbct-viewer:force16bit';
   const MB = 1024 * 1024;
 
   /**
@@ -160,6 +161,27 @@
   const resolvedKey = choice === 'auto' ? autoDetectPreset() : choice;
   const preset = PRESETS[resolvedKey];
 
+  // Texture precision is kept as its own switch, separate from the memory
+  // preset. CBCT data spans a wide value range, and squeezing it into an 8-bit
+  // texture can flatten the contrast between bone, enamel and soft tissue to
+  // the point where the image looks like uniform grey. Being able to force
+  // 16-bit without also raising the cache size makes that testable on a device
+  // that cannot afford the High preset.
+  function readForce16Bit() {
+    try {
+      const stored = window.localStorage.getItem(PRECISION_KEY);
+      if (stored === 'true') return true;
+      if (stored === 'false') return false;
+    } catch (e) {
+      // localStorage may be unavailable in a restricted webview.
+    }
+    return null; // follow the preset
+  }
+
+  const force16Bit = readForce16Bit();
+  const preferSizeOverAccuracy =
+    force16Bit === null ? preset.preferSizeOverAccuracy : !force16Bit;
+
   // Expose for the settings UI and for troubleshooting from a console.
   window.cbctQuality = {
     storageKey: STORAGE_KEY,
@@ -167,6 +189,8 @@
     presetOrder: PRESET_ORDER,
     choice: choice,
     resolved: resolvedKey,
+    force16Bit: force16Bit,
+    preferSizeOverAccuracy: preferSizeOverAccuracy,
     isMobileDevice: isMobileDevice,
     isPackaged: isPackaged,
     platform: isCapacitor ? 'capacitor' : isTauri ? 'tauri' : 'browser',
@@ -179,6 +203,18 @@
         window.localStorage.setItem(STORAGE_KEY, value);
       } catch (e) {
         console.warn('Could not persist quality choice', e);
+      }
+      window.location.reload();
+    },
+    setForce16Bit: function (value) {
+      try {
+        if (value === null) {
+          window.localStorage.removeItem(PRECISION_KEY);
+        } else {
+          window.localStorage.setItem(PRECISION_KEY, value ? 'true' : 'false');
+        }
+      } catch (e) {
+        console.warn('Could not persist precision choice', e);
       }
       window.location.reload();
     },
@@ -197,14 +233,37 @@
     routerBasename: null,
     extensions: [],
     modes: [],
-    customizationService: ['@ohif/extension-default.customizationModule.theme'],
+    customizationService: [
+      '@ohif/extension-default.customizationModule.theme',
+      {
+        // Dental CBCT is reported under the CT modality but is not calibrated
+        // the way a medical CT is, so OHIF's stock CT presets (soft tissue at
+        // level 40, lung at -600) land nowhere near the data. Left alone, the
+        // viewer auto-windows to the full value range — on a typical scan that
+        // is a window several thousand wide, which compresses every tissue into
+        // near-identical grey. These presets sit where dental CBCT data
+        // actually lives; the stock CT ones are kept underneath.
+        'cornerstone.windowLevelPresets': {
+          CT: [
+            { id: 'cbct-bone', description: 'CBCT bone', window: '2500', level: '500' },
+            { id: 'cbct-teeth', description: 'CBCT teeth / enamel', window: '3500', level: '1400' },
+            { id: 'cbct-soft', description: 'CBCT soft tissue', window: '500', level: '60' },
+            { id: 'cbct-airway', description: 'CBCT airway / sinus', window: '1400', level: '-400' },
+            { id: 'cbct-wide', description: 'CBCT full range', window: '4000', level: '900' },
+            { id: 'ct-soft-tissue', description: 'CT soft tissue', window: '400', level: '40' },
+            { id: 'ct-bone', description: 'CT bone', window: '2500', level: '480' },
+            { id: 'ct-lung', description: 'CT lung', window: '1500', level: '-600' },
+          ],
+        },
+      },
+    ],
 
     // No remote study list — this build opens local files only.
     showStudyList: false,
 
     // Applied by extensions/cornerstone/src/init.tsx.
     renderingQuality: {
-      preferSizeOverAccuracy: preset.preferSizeOverAccuracy,
+      preferSizeOverAccuracy: preferSizeOverAccuracy,
       sampleDistanceMultiplier: preset.sampleDistanceMultiplier,
       webGlContextCount: preset.webGlContextCount,
     },
@@ -317,12 +376,37 @@
       ' · ' +
       (detected.cores ? detected.cores + ' cores' : 'cores unknown');
 
+    const precisionState =
+      force16Bit === null ? 'preset' : force16Bit ? 'on' : 'off';
+    const precisionRows = [
+      ['preset', 'Follow preset', 'Currently ' + (preferSizeOverAccuracy ? '8-bit' : '16-bit') + '.'],
+      ['on', 'Force 16-bit', 'Full precision textures. Use if the image looks flat or uniformly grey.'],
+      ['off', 'Force 8-bit', 'Half the GPU memory, less intensity detail.'],
+    ]
+      .map(function (row) {
+        const active = row[0] === precisionState ? ' active' : '';
+        const checked = row[0] === precisionState ? ' checked' : '';
+        return (
+          '<label class="' + active.trim() + '">' +
+          '<div class="name"><input type="radio" name="cbct-p" value="' + row[0] + '"' +
+          checked + '>' + row[1] + '</div>' +
+          '<div class="hint">' + row[2] + '</div>' +
+          '</label>'
+        );
+      })
+      .join('');
+
     panel.innerHTML =
       '<h3>Rendering quality</h3>' +
       '<div class="sub">Lower settings use less memory and render faster. ' +
       'Higher settings are sharper but can fail on devices with limited GPU memory. ' +
       'Changing this reloads the viewer.</div>' +
       rows +
+      '<h3 style="margin-top:14px">Texture precision</h3>' +
+      '<div class="sub">Independent of the preset above. CBCT data covers a wide ' +
+      'value range, and 8-bit textures can flatten it until everything looks the ' +
+      'same shade of grey.</div>' +
+      precisionRows +
       '<div class="foot">Detected: ' + detectedText +
       '<br>Not a certified medical device. Do not use as the sole basis for diagnosis.</div>';
 
@@ -334,6 +418,11 @@
       const target = event.target;
       if (target && target.name === 'cbct-q') {
         window.cbctQuality.set(target.value);
+      }
+      if (target && target.name === 'cbct-p') {
+        window.cbctQuality.setForce16Bit(
+          target.value === 'preset' ? null : target.value === 'on'
+        );
       }
     });
 
