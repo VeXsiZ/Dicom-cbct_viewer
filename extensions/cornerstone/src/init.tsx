@@ -114,15 +114,56 @@ export default async function init({
   }
   setViewportRenderingOverrides(renderBackendByViewportType);
 
+  // --- User-selectable rendering quality (CBCT viewer) -----------------------
+  // appConfig.renderingQuality is produced by the quality preset resolver in the
+  // app config (see public/config/cbct.js). It lets the END USER trade image
+  // fidelity for memory/FPS at runtime, which is what makes large CBCT volumes
+  // survive on phones. Every field is optional: when absent we leave the
+  // cornerstone default untouched, so a stock OHIF config behaves exactly as
+  // before. See the Cornerstone3DConfig type for the supported keys.
+  const renderingQuality = appConfig.renderingQuality ?? {};
+  const existingRendering = cornerstone.getConfiguration().rendering ?? {};
+
+  const qualityRendering: Record<string, unknown> = {};
+
+  // 8-bit instead of 16-bit volume textures. Roughly halves GPU memory for a
+  // CBCT volume at a small cost in intensity precision — the single biggest
+  // lever for getting a full scan onto a mid-range mobile GPU.
+  if (renderingQuality.preferSizeOverAccuracy !== undefined) {
+    qualityRendering.preferSizeOverAccuracy = Boolean(
+      renderingQuality.preferSizeOverAccuracy
+    );
+  }
+
+  // Number of simultaneous WebGL contexts. Lower values reduce the chance of a
+  // mobile browser dropping the context (which blanks the viewport).
+  if (renderingQuality.webGlContextCount !== undefined) {
+    qualityRendering.webGlContextCount = renderingQuality.webGlContextCount;
+  }
+
+  // 3D raycasting step size. This is the actual "3D resolution" dial:
+  // 1 = full quality (sample every voxel), >1 = bigger steps, fewer samples,
+  // faster but grainier. Values around 2-4 keep volume rendering interactive on
+  // phones that cannot sustain a full-rate raycast.
+  if (renderingQuality.sampleDistanceMultiplier !== undefined) {
+    qualityRendering.volumeRendering = {
+      ...(existingRendering.volumeRendering ?? {}),
+      sampleDistanceMultiplier: renderingQuality.sampleDistanceMultiplier,
+    };
+  }
+
   cornerstone.setConfiguration({
     ...cornerstone.getConfiguration(),
+    // Tells cornerstone to apply its own mobile-oriented internal defaults.
+    ...(appConfig.isMobile !== undefined ? { isMobile: Boolean(appConfig.isMobile) } : {}),
     rendering: {
-      ...cornerstone.getConfiguration().rendering,
+      ...existingRendering,
       strictZSpacingForVolumeViewport: appConfig.strictZSpacingForVolumeViewport,
       // Opt-in: route legacy viewport types through the new GenericViewport render
       // paths while keeping the legacy public API via compatibility adapters.
       // No-op on cornerstone builds that predate the GenericViewport architecture.
       useGenericViewport: Boolean(appConfig.useGenericViewport),
+      ...qualityRendering,
     },
   });
 

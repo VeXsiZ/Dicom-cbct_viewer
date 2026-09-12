@@ -1,0 +1,13 @@
+{
+  "name": "cbct-viewer-desktop",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Tauri wrapper that packages the built CBCT viewer as a Windows desktop app.",
+  "scripts": {
+    "build": "tauri build",
+    "dev": "tauri dev"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "2.11.4"
+  }
+}

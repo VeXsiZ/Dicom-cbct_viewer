@@ -1,0 +1,390 @@
+name: Build Apps (Android / Windows / iOS)
+
+# One button: Actions tab -> "Build Apps" -> "Run workflow".
+# The viewer is built once on Linux, then that same web bundle is wrapped into
+# each native package, so all three platforms ship identical viewer code.
+
+on:
+  workflow_dispatch:
+    inputs:
+      android:
+        description: 'Build Android APK'
+        type: boolean
+        default: true
+      windows:
+        description: 'Build Windows installer (.exe)'
+        type: boolean
+        default: true
+      ios:
+        description: 'Build iOS app (.ipa)'
+        type: boolean
+        default: false
+      ios_signing:
+        description: 'iOS signing: "unsigned" (free Apple ID, sign on device with SideStore/Sideloadly) or "signed" (paid Apple Developer account, needs secrets)'
+        type: choice
+        options:
+          - unsigned
+          - signed
+        default: unsigned
+      publish_release:
+        description: 'Attach the builds to a GitHub Release'
+        type: boolean
+        default: true
+
+# Needed so the release job can create a tag/release.
+permissions:
+  contents: write
+
+env:
+  # Which OHIF app config the packaged builds use.
+  APP_CONFIG: config/cbct.js
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Build the viewer once. Everything downstream reuses this bundle.
+  # ---------------------------------------------------------------------------
+  web:
+    name: Build viewer bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read required Node version
+        id: nodever
+        run: echo "version=$(cat .node-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build viewer
+        env:
+          NODE_ENV: production
+          PUBLIC_URL: /
+          QUICK_BUILD: 'false'
+        run: pnpm --filter @ohif/app run build
+
+      - name: Sanity check the bundle
+        run: |
+          test -f platform/app/dist/index.html || { echo "::error::index.html missing"; exit 1; }
+          test -f platform/app/dist/app-config.js || echo "::warning::app-config.js not found under that name"
+          echo "Bundle size: $(du -sh platform/app/dist | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viewer-dist
+          path: platform/app/dist
+          retention-days: 5
+
+  # ---------------------------------------------------------------------------
+  # 2. Android -> .apk
+  # ---------------------------------------------------------------------------
+  android:
+    name: Android APK
+    needs: web
+    if: ${{ inputs.android }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer-dist
+          path: packaging/mobile/www
+
+      - name: Install Capacitor
+        working-directory: packaging/mobile
+        run: npm install
+
+      - name: Add Android platform
+        working-directory: packaging/mobile
+        run: npx cap add android
+
+      - name: Generate launcher icons and splash
+        working-directory: packaging/mobile
+        continue-on-error: true
+        run: npx @capacitor/assets generate --android --iconBackgroundColor '#0c1a26' --splashBackgroundColor '#0c1a26'
+
+      - name: Sync web assets into the Android project
+        working-directory: packaging/mobile
+        run: npx cap sync android
+
+      # Signing is optional. If ANDROID_KEYSTORE_BASE64 is set in repo secrets we
+      # produce a release-signed APK; otherwise we fall back to a debug-signed
+      # one, which sideloads just fine. The check lives inside `run` rather than
+      # in `if:` because the secrets context is not dependable in step conditions.
+      - name: Decode release keystore
+        id: keystore
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$ANDROID_KEYSTORE_BASE64" ]; then
+            echo "$ANDROID_KEYSTORE_BASE64" | base64 -d > packaging/mobile/android/release.keystore
+            echo "present=true" >> "$GITHUB_OUTPUT"
+            echo "Release keystore found — building a signed APK."
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No keystore secret — building a debug-signed APK (sideloadable)."
+          fi
+
+      - name: Build signed release APK
+        if: ${{ steps.keystore.outputs.present == 'true' }}
+        working-directory: packaging/mobile/android
+        env:
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleRelease \
+            -Pandroid.injected.signing.store.file=$(pwd)/release.keystore \
+            -Pandroid.injected.signing.store.password="$KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$KEY_PASSWORD"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/release/*.apk "$GITHUB_WORKSPACE/out/CBCT-Viewer.apk"
+
+      # No keystore configured: a debug-signed APK is still perfectly
+      # installable by sideloading, it just cannot go on the Play Store.
+      - name: Build debug APK
+        if: ${{ steps.keystore.outputs.present != 'true' }}
+        working-directory: packaging/mobile/android
+        run: |
+          ./gradlew assembleDebug
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp app/build/outputs/apk/debug/*.apk "$GITHUB_WORKSPACE/out/CBCT-Viewer.apk"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CBCT-Viewer-android
+          path: out/CBCT-Viewer.apk
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 3. Windows -> .exe installer
+  # ---------------------------------------------------------------------------
+  windows:
+    name: Windows installer
+    needs: web
+    if: ${{ inputs.windows }}
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/desktop/src-tauri
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer-dist
+          path: packaging/desktop/dist
+
+      - name: Install Tauri CLI
+        working-directory: packaging/desktop
+        run: npm install
+
+      - name: Build Windows installer
+        working-directory: packaging/desktop
+        run: npx tauri build
+
+      - name: Collect installer
+        shell: bash
+        run: |
+          mkdir -p out
+          find packaging/desktop/src-tauri/target/release/bundle -name '*-setup.exe' -exec cp {} out/CBCT-Viewer-Setup.exe \;
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CBCT-Viewer-windows
+          path: out/CBCT-Viewer-Setup.exe
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 4. iOS -> .ipa
+  # ---------------------------------------------------------------------------
+  ios:
+    name: iOS app
+    needs: web
+    if: ${{ inputs.ios }}
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer-dist
+          path: packaging/mobile/www
+
+      - name: Install Capacitor
+        working-directory: packaging/mobile
+        run: npm install
+
+      - name: Add iOS platform
+        working-directory: packaging/mobile
+        run: npx cap add ios
+
+      - name: Generate app icons and splash
+        working-directory: packaging/mobile
+        continue-on-error: true
+        run: npx @capacitor/assets generate --ios --iconBackgroundColor '#0c1a26' --splashBackgroundColor '#0c1a26'
+
+      - name: Sync web assets into the iOS project
+        working-directory: packaging/mobile
+        run: npx cap sync ios
+
+      # --- unsigned path (free Apple ID) --------------------------------------
+      # Xcode archives without a signing identity, then we hand-roll the IPA by
+      # zipping the .app into a Payload/ folder. The result is NOT installable
+      # as-is: sign it on your own machine/phone with SideStore, AltStore or
+      # Sideloadly using a free Apple ID. That signature lasts 7 days.
+      - name: Build unsigned IPA
+        if: ${{ inputs.ios_signing == 'unsigned' }}
+        working-directory: packaging/mobile/ios/App
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" "$RUNNER_TEMP/Payload/"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/out/CBCT-Viewer-unsigned.ipa" Payload)
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      # --- signed path (paid Apple Developer account) -------------------------
+      - name: Import signing certificate
+        if: ${{ inputs.ios_signing == 'signed' }}
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+
+      - name: Install provisioning profile
+        if: ${{ inputs.ios_signing == 'signed' }}
+        env:
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROFILE_BASE64" | base64 -d > ~/Library/MobileDevice/Provisioning\ Profiles/build.mobileprovision
+
+      - name: Build signed IPA
+        if: ${{ inputs.ios_signing == 'signed' }}
+        working-directory: packaging/mobile/ios/App
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD || 'development' }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>compileBitcode</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            archive
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$RUNNER_TEMP/export"/*.ipa "$GITHUB_WORKSPACE/out/CBCT-Viewer.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CBCT-Viewer-ios
+          path: out/*.ipa
+          retention-days: 30
+
+  # ---------------------------------------------------------------------------
+  # 5. Collect everything into one downloadable Release.
+  # ---------------------------------------------------------------------------
+  release:
+    name: Publish release
+    needs: [android, windows, ios]
+    if: ${{ always() && inputs.publish_release && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          pattern: CBCT-Viewer-*
+          merge-multiple: true
+
+      - name: List collected files
+        run: ls -laR artifacts || echo "no artifacts"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-${{ github.run_number }}
+          name: CBCT Viewer build ${{ github.run_number }}
+          files: artifacts/**/*
+          fail_on_unmatched_files: false
+          body: |
+            Automated build #${{ github.run_number }} from `${{ github.sha }}`.
+
+            | File | Platform | How to install |
+            |---|---|---|
+            | `CBCT-Viewer.apk` | Android | Download on the phone, allow "install unknown apps", tap to install. |
+            | `CBCT-Viewer-Setup.exe` | Windows | Run the installer. |
+            | `CBCT-Viewer-unsigned.ipa` | iPhone (free Apple ID) | Sign it yourself with SideStore / AltStore / Sideloadly. Signature expires after 7 days. |
+            | `CBCT-Viewer.ipa` | iPhone (paid account) | Install directly or push to TestFlight. |
+
+            ---
+            **Not a certified medical device.** This build has not been cleared by
+            the FDA, under EU MDR, or by any other regulator. Rendering quality
+            presets deliberately reduce image fidelity to fit constrained
+            hardware. Do not use it as the sole basis for diagnosis or treatment
+            planning.

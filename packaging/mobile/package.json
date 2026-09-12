@@ -1,0 +1,22 @@
+{
+  "name": "cbct-viewer-mobile",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Capacitor wrapper that packages the built CBCT viewer as an Android (.apk) and iOS (.ipa) app.",
+  "scripts": {
+    "add:android": "cap add android",
+    "add:ios": "cap add ios",
+    "sync": "cap sync",
+    "sync:android": "cap sync android",
+    "sync:ios": "cap sync ios"
+  },
+  "dependencies": {
+    "@capacitor/android": "8.5.2",
+    "@capacitor/core": "8.5.2",
+    "@capacitor/filesystem": "8.1.3",
+    "@capacitor/ios": "8.5.2"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "8.5.2"
+  }
+}

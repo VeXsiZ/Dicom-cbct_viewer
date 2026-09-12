@@ -1,0 +1,345 @@
+/** @type {AppTypes.Config} */
+
+/**
+ * CBCT Viewer — packaged app configuration.
+ *
+ * This config is used by the Android (.apk), iOS (.ipa) and Windows (.exe)
+ * builds. It differs from the stock OHIF configs in three ways:
+ *
+ *   1. It is OFFLINE-FIRST. The only data source is `dicomlocal`, which reads
+ *      DICOM files the user picks from the device. There is no PACS/DICOMweb
+ *      server involved, so the app works with no network at all.
+ *
+ *   2. It exposes a USER-FACING RENDERING QUALITY setting. CBCT volumes are
+ *      large (a few hundred slices is normal) and a phone GPU cannot always
+ *      hold one at full precision. The user picks a preset; the preset maps to
+ *      concrete cornerstone settings that are applied at boot.
+ *
+ *   3. It injects a small settings panel (the gear button, bottom-right) so the
+ *      quality preset can be changed from inside the packaged app, where there
+ *      is no address bar to pass URL parameters through.
+ *
+ * -----------------------------------------------------------------------------
+ * IMPORTANT — NOT A CERTIFIED MEDICAL DEVICE
+ * This build has not been cleared or certified by any regulatory body (FDA, CE/
+ * MDR, or otherwise). The quality presets below intentionally *reduce* image
+ * fidelity to fit constrained hardware. Do not rely on this viewer as the
+ * primary basis for diagnosis or treatment planning.
+ * -----------------------------------------------------------------------------
+ */
+
+(function () {
+  const STORAGE_KEY = 'cbct-viewer:quality';
+  const MB = 1024 * 1024;
+
+  /**
+   * Quality presets.
+   *
+   * maxCacheSize             bytes cornerstone may hold in its image cache
+   * maxNumberOfWebWorkers    decode parallelism (more = faster, more RAM)
+   * preferSizeOverAccuracy   8-bit volume textures instead of 16-bit. Halves
+   *                          GPU memory. Slightly coarser intensity steps.
+   * sampleDistanceMultiplier 3D raycast step size. 1 = sample every voxel
+   *                          (sharpest, slowest). Higher = faster, grainier.
+   * webGlContextCount        simultaneous WebGL contexts; fewer is safer on
+   *                          mobile GPUs that drop contexts under pressure.
+   */
+  const PRESETS = {
+    low: {
+      label: 'Low — maximum compatibility',
+      hint: 'Older or low-RAM phones. Coarse 3D, but least likely to crash.',
+      maxCacheSize: 256 * MB,
+      maxNumberOfWebWorkers: 2,
+      preferSizeOverAccuracy: true,
+      sampleDistanceMultiplier: 4,
+      webGlContextCount: 1,
+      prefetch: 10,
+    },
+    medium: {
+      label: 'Medium — balanced',
+      hint: 'Good default for most phones and tablets.',
+      maxCacheSize: 768 * MB,
+      maxNumberOfWebWorkers: 3,
+      preferSizeOverAccuracy: true,
+      sampleDistanceMultiplier: 2,
+      webGlContextCount: 2,
+      prefetch: 20,
+    },
+    high: {
+      label: 'High — full precision',
+      hint: 'Recent flagship phones, tablets and most PCs. 16-bit volumes.',
+      maxCacheSize: 1536 * MB,
+      maxNumberOfWebWorkers: 4,
+      preferSizeOverAccuracy: false,
+      sampleDistanceMultiplier: 1.5,
+      webGlContextCount: 3,
+      prefetch: 25,
+    },
+    ultra: {
+      label: 'Ultra — desktop',
+      hint: 'Windows/desktop with a dedicated GPU. Sharpest 3D, most memory.',
+      maxCacheSize: 3072 * MB,
+      maxNumberOfWebWorkers: 6,
+      preferSizeOverAccuracy: false,
+      sampleDistanceMultiplier: 1,
+      webGlContextCount: 4,
+      prefetch: 40,
+    },
+  };
+
+  const PRESET_ORDER = ['low', 'medium', 'high', 'ultra'];
+
+  // --- platform detection ----------------------------------------------------
+  // Capacitor exposes window.Capacitor; Tauri exposes __TAURI__ / __TAURI_INTERNALS__.
+  const isCapacitor = typeof window.Capacitor !== 'undefined';
+  const isTauri =
+    typeof window.__TAURI__ !== 'undefined' ||
+    typeof window.__TAURI_INTERNALS__ !== 'undefined';
+  const isPackaged = isCapacitor || isTauri;
+
+  const isMobileDevice =
+    isCapacitor ||
+    /Android|iPhone|iPad|iPod/i.test(navigator.userAgent || '') ||
+    // iPadOS 13+ reports as desktop Safari but has a touch screen.
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  /**
+   * Pick a preset when the user has chosen "auto".
+   *
+   * navigator.deviceMemory is Chromium-only (so: Android yes, iOS Safari no)
+   * and is deliberately coarse — it reports 0.25/0.5/1/2/4/8 GB and caps at 8.
+   * hardwareConcurrency is available almost everywhere and is used as the
+   * fallback signal. When we know nothing, we bias LOW on mobile: a viewer that
+   * renders coarsely is far more useful than one that runs out of memory and
+   * shows a blank viewport.
+   */
+  function autoDetectPreset() {
+    const memory = navigator.deviceMemory; // GB, may be undefined
+    const cores = navigator.hardwareConcurrency || 0;
+
+    if (!isMobileDevice) {
+      // Desktop: Tauri/Windows and browsers on a PC.
+      if (memory && memory <= 4) return 'high';
+      return 'ultra';
+    }
+
+    if (memory) {
+      if (memory <= 2) return 'low';
+      if (memory <= 4) return 'medium';
+      return 'high';
+    }
+
+    // No deviceMemory signal (typical on iOS). Fall back to core count.
+    if (cores >= 6) return 'medium';
+    return 'low';
+  }
+
+  function readStoredChoice() {
+    try {
+      const stored = window.localStorage.getItem(STORAGE_KEY);
+      if (stored === 'auto' || PRESETS[stored]) return stored;
+    } catch (e) {
+      // localStorage can throw in private mode / restricted webviews.
+    }
+    return 'auto';
+  }
+
+  const choice = readStoredChoice();
+  const resolvedKey = choice === 'auto' ? autoDetectPreset() : choice;
+  const preset = PRESETS[resolvedKey];
+
+  // Expose for the settings UI and for troubleshooting from a console.
+  window.cbctQuality = {
+    storageKey: STORAGE_KEY,
+    presets: PRESETS,
+    presetOrder: PRESET_ORDER,
+    choice: choice,
+    resolved: resolvedKey,
+    isMobileDevice: isMobileDevice,
+    isPackaged: isPackaged,
+    platform: isCapacitor ? 'capacitor' : isTauri ? 'tauri' : 'browser',
+    detected: {
+      deviceMemoryGB: navigator.deviceMemory ?? null,
+      cores: navigator.hardwareConcurrency ?? null,
+    },
+    set: function (value) {
+      try {
+        window.localStorage.setItem(STORAGE_KEY, value);
+      } catch (e) {
+        console.warn('Could not persist quality choice', e);
+      }
+      window.location.reload();
+    },
+  };
+
+  console.log(
+    `[CBCT] quality "${choice}" -> "${resolvedKey}"`,
+    window.cbctQuality.detected
+  );
+
+  // --- OHIF configuration ----------------------------------------------------
+  window.config = {
+    name: 'config/cbct.js',
+    // null keeps every asset path relative to wherever index.html is served
+    // from. Required for the Capacitor webview and the Tauri asset protocol.
+    routerBasename: null,
+    extensions: [],
+    modes: [],
+    customizationService: ['@ohif/extension-default.customizationModule.theme'],
+
+    // No remote study list — this build opens local files only.
+    showStudyList: false,
+
+    // Applied by extensions/cornerstone/src/init.tsx.
+    renderingQuality: {
+      preferSizeOverAccuracy: preset.preferSizeOverAccuracy,
+      sampleDistanceMultiplier: preset.sampleDistanceMultiplier,
+      webGlContextCount: preset.webGlContextCount,
+    },
+    isMobile: isMobileDevice,
+    maxCacheSize: preset.maxCacheSize,
+    maxNumberOfWebWorkers: preset.maxNumberOfWebWorkers,
+    maxNumRequests: {
+      interaction: 100,
+      thumbnail: 5,
+      prefetch: preset.prefetch,
+    },
+
+    showWarningMessageForCrossOrigin: false,
+    showCPUFallbackMessage: true,
+    showLoadingIndicator: true,
+    strictZSpacingForVolumeViewport: true,
+    groupEnabledModesFirst: true,
+    allowMultiSelectExport: false,
+    showErrorDetails: 'always',
+    useSharedArrayBuffer: 'AUTO',
+
+    defaultDataSourceName: 'dicomlocal',
+    dataSources: [
+      {
+        namespace: '@ohif/extension-default.dataSourcesModule.dicomlocal',
+        sourceName: 'dicomlocal',
+        configuration: {
+          friendlyName: 'Local files',
+        },
+      },
+    ],
+  };
+
+  // --- in-app settings panel -------------------------------------------------
+  // The packaged apps have no address bar, so URL parameters are not reachable.
+  // This is a deliberately dependency-free overlay rather than an OHIF React
+  // component: OHIF's internal UI moves fast between releases, and keeping this
+  // outside the component tree means rebasing onto a newer OHIF will not break
+  // it.
+  function mountSettingsPanel() {
+    if (document.getElementById('cbct-quality-root')) return;
+
+    const root = document.createElement('div');
+    root.id = 'cbct-quality-root';
+
+    const style = document.createElement('style');
+    style.textContent = `
+      #cbct-quality-root { position: fixed; inset: auto 0 0 auto; z-index: 2147483000;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+      #cbct-quality-btn { position: fixed; right: 14px; bottom: 14px; width: 44px;
+        height: 44px; border-radius: 50%; border: 1px solid #3a4a5e;
+        background: #10202e; color: #cfe3f5; font-size: 19px; cursor: pointer;
+        display: flex; align-items: center; justify-content: center;
+        box-shadow: 0 2px 10px rgba(0,0,0,.45); }
+      #cbct-quality-btn:hover { background: #17304a; }
+      #cbct-quality-panel { position: fixed; right: 14px; bottom: 68px; width: 310px;
+        max-width: calc(100vw - 28px); max-height: calc(100vh - 100px);
+        overflow-y: auto; background: #0d1a26; color: #dbe8f4;
+        border: 1px solid #33475c; border-radius: 10px; padding: 14px;
+        box-shadow: 0 6px 26px rgba(0,0,0,.55); display: none; }
+      #cbct-quality-panel.open { display: block; }
+      #cbct-quality-panel h3 { margin: 0 0 4px; font-size: 15px; font-weight: 600; }
+      #cbct-quality-panel .sub { font-size: 11.5px; color: #8fa6bc; margin-bottom: 12px;
+        line-height: 1.45; }
+      #cbct-quality-panel label { display: block; border: 1px solid #2b3d50;
+        border-radius: 7px; padding: 9px 10px; margin-bottom: 7px; cursor: pointer; }
+      #cbct-quality-panel label:hover { border-color: #4a6a8a; background: #122435; }
+      #cbct-quality-panel label.active { border-color: #4b90c8; background: #12283b; }
+      #cbct-quality-panel .name { font-size: 13px; font-weight: 500; }
+      #cbct-quality-panel .hint { font-size: 11px; color: #8fa6bc; margin-top: 3px;
+        line-height: 1.4; }
+      #cbct-quality-panel input { margin-right: 7px; accent-color: #4b90c8; }
+      #cbct-quality-panel .foot { font-size: 10.5px; color: #7b90a5; margin-top: 10px;
+        border-top: 1px solid #253748; padding-top: 9px; line-height: 1.5; }
+    `;
+
+    const button = document.createElement('button');
+    button.id = 'cbct-quality-btn';
+    button.type = 'button';
+    button.title = 'Rendering quality';
+    button.setAttribute('aria-label', 'Rendering quality settings');
+    button.textContent = '\u2699';
+
+    const panel = document.createElement('div');
+    panel.id = 'cbct-quality-panel';
+
+    const options = ['auto'].concat(PRESET_ORDER);
+    const rows = options
+      .map(function (key) {
+        const isAuto = key === 'auto';
+        const label = isAuto ? 'Automatic' : PRESETS[key].label;
+        const hint = isAuto
+          ? 'Choose based on this device. Currently: ' + PRESETS[resolvedKey].label
+          : PRESETS[key].hint;
+        const active = key === choice ? ' active' : '';
+        const checked = key === choice ? ' checked' : '';
+        return (
+          '<label class="' + active.trim() + '" data-key="' + key + '">' +
+          '<div class="name"><input type="radio" name="cbct-q" value="' + key + '"' +
+          checked + '>' + label + '</div>' +
+          '<div class="hint">' + hint + '</div>' +
+          '</label>'
+        );
+      })
+      .join('');
+
+    const detected = window.cbctQuality.detected;
+    const detectedText =
+      (detected.deviceMemoryGB ? detected.deviceMemoryGB + ' GB RAM' : 'RAM unknown') +
+      ' · ' +
+      (detected.cores ? detected.cores + ' cores' : 'cores unknown');
+
+    panel.innerHTML =
+      '<h3>Rendering quality</h3>' +
+      '<div class="sub">Lower settings use less memory and render faster. ' +
+      'Higher settings are sharper but can fail on devices with limited GPU memory. ' +
+      'Changing this reloads the viewer.</div>' +
+      rows +
+      '<div class="foot">Detected: ' + detectedText +
+      '<br>Not a certified medical device. Do not use as the sole basis for diagnosis.</div>';
+
+    button.addEventListener('click', function () {
+      panel.classList.toggle('open');
+    });
+
+    panel.addEventListener('change', function (event) {
+      const target = event.target;
+      if (target && target.name === 'cbct-q') {
+        window.cbctQuality.set(target.value);
+      }
+    });
+
+    document.addEventListener('click', function (event) {
+      if (!panel.classList.contains('open')) return;
+      if (panel.contains(event.target) || button.contains(event.target)) return;
+      panel.classList.remove('open');
+    });
+
+    root.appendChild(style);
+    root.appendChild(button);
+    root.appendChild(panel);
+    document.body.appendChild(root);
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', mountSettingsPanel);
+  } else {
+    mountSettingsPanel();
+  }
+})();
