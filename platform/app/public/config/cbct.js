@@ -29,6 +29,18 @@
  */
 
 (function () {
+  // --- landing route ---------------------------------------------------------
+  // With `showStudyList: false` OHIF registers no route for `/`, so the app
+  // would boot straight into its 404 page. The local file loader lives at
+  // `/localbasic`, which drops the user into the viewer once files are picked
+  // (`/local` instead returns to the study list, which does not exist here).
+  // This runs before the app bundle, so the router sees the corrected path on
+  // its first read.
+  const path = window.location.pathname;
+  if (path === '/' || path === '' || path === '/index.html') {
+    window.history.replaceState(null, '', '/localbasic' + window.location.search);
+  }
+
   const STORAGE_KEY = 'cbct-viewer:quality';
   const MB = 1024 * 1024;
 
