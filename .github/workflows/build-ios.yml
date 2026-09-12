@@ -147,12 +147,21 @@ jobs:
           path: out/*.ipa
           retention-days: 30
 
+      # Surfaces the commit in the release title. A *re-run* of an existing run
+      # keeps the same run_number AND replays the same old commit, so it
+      # silently overwrites the earlier release with an identical build. Showing
+      # the short SHA makes that visible at a glance in the releases list.
+      - name: Short commit sha
+        id: sha
+        shell: bash
+        run: echo "short=$(echo ${{ github.sha }} | cut -c1-7)" >> "$GITHUB_OUTPUT"
+
       - name: Publish release
         if: ${{ inputs.publish_release }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ios-${{ github.run_number }}
-          name: iOS build ${{ github.run_number }}
+          name: iOS build ${{ github.run_number }} — ${{ steps.sha.outputs.short }}
           files: out/*.ipa
           fail_on_unmatched_files: false
           body: |
