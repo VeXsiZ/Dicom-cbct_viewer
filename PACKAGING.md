@@ -16,22 +16,42 @@ same code:
 
 ---
 
-## Building — the one button
+## Building
+
+Each platform has its own workflow, so they run independently — if the Android
+build breaks, Windows and iOS are unaffected.
 
 1. Open the repository on GitHub → **Actions** tab
-2. Select **Build Apps (Android / Windows / iOS)** in the left sidebar
-3. Press **Run workflow**
-4. Tick the platforms you want, then **Run workflow** again
+2. Pick the workflow you want in the left sidebar:
+   - **Build Android APK**
+   - **Build Windows Installer**
+   - **Build iOS App**
+3. Press **Run workflow** → **Run workflow**
 
 Everything runs on GitHub's servers, so no PC is needed. Android and Windows
-need no setup at all. When the run finishes, the files appear in two places:
+need no setup at all. When a run finishes the file appears in two places:
 
-- **Releases** — a release tagged `build-<number>` with all files attached
-- **Actions → the run → Artifacts** — the same files as zips
+- **Releases** — tagged `android-<n>`, `windows-<n>` or `ios-<n>`
+- **Actions → the run → Artifacts**
 
 Both are downloadable directly from a phone browser.
 
-A full run takes roughly 15–30 minutes, most of it the viewer bundle.
+Each workflow builds the viewer bundle itself (via the shared `_build-web`
+reusable workflow) and then wraps it. That means the bundle is built once per
+platform rather than once in total — the cost of keeping the three fully
+isolated from each other. A run takes roughly 15–30 minutes, most of it the
+bundle.
+
+`_build-web.yml` is a building block, not something to run on its own; it has
+no "Run workflow" button.
+
+### A note on the inherited OHIF workflows
+
+The fork arrived with upstream OHIF's own CI. `build-docs.yml` ran on every
+push and always failed here — it tries to deploy to OHIF's documentation site
+and looks for a merged pull request that a fork does not have. It has been
+removed. CodeQL's weekly cron was switched to manual-only, and Playwright only
+runs on pull requests. Nothing now triggers automatically on push.
 
 ## Installing
 
@@ -49,8 +69,8 @@ anyway".
 
 ## iOS signing — the two paths
 
-The workflow supports both, chosen by the **iOS signing** dropdown when you
-start a run.
+Both are supported, chosen by the **signing** dropdown when you start the
+**Build iOS App** workflow.
 
 ### `unsigned` — free Apple ID
 
@@ -81,7 +101,7 @@ itself is identical, only the signing step differs.
 
 ## Optional: signed Android release
 
-Add these secrets and the workflow switches from a debug APK to a
+Add these secrets and the Android workflow switches from a debug APK to a
 release-signed one automatically:
 
 `ANDROID_KEYSTORE_BASE64`, `ANDROID_KEYSTORE_PASSWORD`, `ANDROID_KEY_ALIAS`,
@@ -152,7 +172,11 @@ packaging/
   scripts/
     generate-icons.py
 platform/app/public/config/cbct.js    app config, quality presets, settings UI
-.github/workflows/build-apps.yml      the one-button build
+.github/workflows/
+  _build-web.yml     shared: builds the viewer bundle
+  build-android.yml  Android APK
+  build-windows.yml  Windows installer
+  build-ios.yml      iOS IPA
 ```
 
 The `android/`, `ios/`, `www/` and `dist/` folders are generated during the

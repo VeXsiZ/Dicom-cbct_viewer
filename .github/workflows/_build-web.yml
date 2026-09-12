@@ -1,0 +1,64 @@
+name: _build-web
+
+# Reusable building block, not meant to be run on its own. Each platform
+# workflow calls this first to produce the viewer bundle, then wraps it.
+# Because every platform workflow calls it independently, a failure here only
+# affects the one platform that is running.
+
+on:
+  workflow_call:
+    inputs:
+      app_config:
+        description: 'Which OHIF app config to bake in'
+        type: string
+        default: 'config/cbct.js'
+    outputs:
+      artifact:
+        description: 'Name of the uploaded bundle artifact'
+        value: viewer-dist
+
+jobs:
+  build:
+    name: Build viewer bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read required Node version
+        id: nodever
+        run: echo "version=$(cat .node-version)" >> "$GITHUB_OUTPUT"
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.5.2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ steps.nodever.outputs.version }}
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build viewer
+        env:
+          APP_CONFIG: ${{ inputs.app_config }}
+          NODE_ENV: production
+          PUBLIC_URL: /
+          QUICK_BUILD: 'false'
+        run: pnpm --filter @ohif/app run build
+
+      - name: Sanity check the bundle
+        run: |
+          test -f platform/app/dist/index.html \
+            || { echo "::error::index.html missing from the bundle"; exit 1; }
+          test -f platform/app/dist/app-config.js \
+            || { echo "::error::app-config.js missing — APP_CONFIG did not get copied"; exit 1; }
+          echo "Bundle size: $(du -sh platform/app/dist | cut -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: viewer-dist
+          path: platform/app/dist
+          retention-days: 5

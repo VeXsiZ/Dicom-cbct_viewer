@@ -1,0 +1,97 @@
+name: Build Windows Installer
+
+# Runs independently of the Android and iOS workflows — a failure here cannot
+# affect those builds, and vice versa.
+#
+# Actions tab -> "Build Windows Installer" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: 'Attach the installer to a GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    uses: ./.github/workflows/_build-web.yml
+
+  installer:
+    name: Package installer
+    needs: web
+    runs-on: windows-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: packaging/desktop/src-tauri
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer-dist
+          path: packaging/desktop/dist
+
+      - name: Install Tauri CLI
+        working-directory: packaging/desktop
+        run: npm install
+
+      - name: Build Windows installer
+        working-directory: packaging/desktop
+        run: npx tauri build
+
+      - name: Collect installer
+        shell: bash
+        run: |
+          mkdir -p out
+          find packaging/desktop/src-tauri/target/release/bundle \
+            -name '*-setup.exe' -exec cp {} out/CBCT-Viewer-Setup.exe \;
+          test -f out/CBCT-Viewer-Setup.exe \
+            || { echo "::error::no installer produced"; exit 1; }
+          ls -la out
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CBCT-Viewer-windows
+          path: out/CBCT-Viewer-Setup.exe
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: windows-${{ github.run_number }}
+          name: Windows build ${{ github.run_number }}
+          files: out/CBCT-Viewer-Setup.exe
+          fail_on_unmatched_files: false
+          body: |
+            Windows installer from `${{ github.sha }}`.
+
+            Run `CBCT-Viewer-Setup.exe`. It installs for the current user, so no
+            administrator rights are needed. SmartScreen will warn about an
+            unknown publisher because the installer is not code-signed — choose
+            "More info" then "Run anyway".
+
+            Both "load folder" and "load files" work on Windows.
+
+            ---
+            **Not a certified medical device.** This build has not been cleared
+            by the FDA, under EU MDR, or by any other regulator, and the quality
+            presets deliberately reduce image fidelity to fit constrained
+            hardware. Do not use it as the sole basis for diagnosis or treatment
+            planning.

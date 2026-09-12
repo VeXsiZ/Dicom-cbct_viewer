@@ -1,0 +1,177 @@
+name: Build iOS App
+
+# Runs independently of the Android and Windows workflows — a failure here
+# cannot affect those builds, and vice versa.
+#
+# Actions tab -> "Build iOS App" -> "Run workflow".
+
+on:
+  workflow_dispatch:
+    inputs:
+      signing:
+        description: 'unsigned = free Apple ID (sign on device with SideStore/AltStore/Sideloadly, 7-day expiry). signed = paid Apple Developer account, needs repo secrets.'
+        type: choice
+        options:
+          - unsigned
+          - signed
+        default: unsigned
+      publish_release:
+        description: 'Attach the IPA to a GitHub Release'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: ios-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  web:
+    uses: ./.github/workflows/_build-web.yml
+
+  ipa:
+    name: Package IPA
+    needs: web
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: viewer-dist
+          path: packaging/mobile/www
+
+      - name: Install Capacitor
+        working-directory: packaging/mobile
+        run: npm install
+
+      - name: Add iOS platform
+        working-directory: packaging/mobile
+        run: npx cap add ios
+
+      - name: Generate app icons and splash
+        working-directory: packaging/mobile
+        continue-on-error: true
+        run: npx @capacitor/assets generate --ios --iconBackgroundColor '#0c1a26' --splashBackgroundColor '#0c1a26'
+
+      - name: Sync web assets into the iOS project
+        working-directory: packaging/mobile
+        run: npx cap sync ios
+
+      # --- unsigned path (free Apple ID) --------------------------------------
+      # Xcode archives without a signing identity, then we hand-roll the IPA by
+      # zipping the .app into a Payload/ folder. The result is NOT installable
+      # as-is: sign it yourself with SideStore, AltStore or Sideloadly using a
+      # free Apple ID. That signature lasts 7 days.
+      - name: Build unsigned IPA
+        if: ${{ inputs.signing == 'unsigned' }}
+        working-directory: packaging/mobile/ios/App
+        run: |
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            CODE_SIGN_IDENTITY="" \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGNING_ALLOWED=NO \
+            archive
+          mkdir -p "$RUNNER_TEMP/Payload"
+          cp -r "$RUNNER_TEMP/App.xcarchive/Products/Applications/App.app" "$RUNNER_TEMP/Payload/"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          (cd "$RUNNER_TEMP" && zip -qry "$GITHUB_WORKSPACE/out/CBCT-Viewer-unsigned.ipa" Payload)
+          ls -la "$GITHUB_WORKSPACE/out"
+
+      # --- signed path (paid Apple Developer account) -------------------------
+      - name: Import signing certificate
+        if: ${{ inputs.signing == 'signed' }}
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.IOS_CERTIFICATE_BASE64 }}
+          p12-password: ${{ secrets.IOS_CERTIFICATE_PASSWORD }}
+
+      - name: Install provisioning profile
+        if: ${{ inputs.signing == 'signed' }}
+        env:
+          PROFILE_BASE64: ${{ secrets.IOS_PROVISIONING_PROFILE_BASE64 }}
+        run: |
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+          echo "$PROFILE_BASE64" | base64 -d \
+            > ~/Library/MobileDevice/Provisioning\ Profiles/build.mobileprovision
+
+      - name: Build signed IPA
+        if: ${{ inputs.signing == 'signed' }}
+        working-directory: packaging/mobile/ios/App
+        env:
+          TEAM_ID: ${{ secrets.IOS_TEAM_ID }}
+          EXPORT_METHOD: ${{ secrets.IOS_EXPORT_METHOD || 'development' }}
+        run: |
+          cat > "$RUNNER_TEMP/ExportOptions.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>method</key><string>${EXPORT_METHOD}</string>
+            <key>teamID</key><string>${TEAM_ID}</string>
+            <key>signingStyle</key><string>automatic</string>
+            <key>compileBitcode</key><false/>
+          </dict>
+          </plist>
+          PLIST
+          xcodebuild \
+            -workspace App.xcworkspace \
+            -scheme App \
+            -configuration Release \
+            -sdk iphoneos \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            DEVELOPMENT_TEAM="$TEAM_ID" \
+            archive
+          xcodebuild -exportArchive \
+            -archivePath "$RUNNER_TEMP/App.xcarchive" \
+            -exportOptionsPlist "$RUNNER_TEMP/ExportOptions.plist" \
+            -exportPath "$RUNNER_TEMP/export"
+          mkdir -p "$GITHUB_WORKSPACE/out"
+          cp "$RUNNER_TEMP/export"/*.ipa "$GITHUB_WORKSPACE/out/CBCT-Viewer.ipa"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CBCT-Viewer-ios
+          path: out/*.ipa
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.publish_release }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ios-${{ github.run_number }}
+          name: iOS build ${{ github.run_number }}
+          files: out/*.ipa
+          fail_on_unmatched_files: false
+          body: |
+            iOS build from `${{ github.sha }}` (signing mode: `${{ inputs.signing }}`).
+
+            **`CBCT-Viewer-unsigned.ipa`** is not installable as-is. Sign it with
+            SideStore, AltStore or Sideloadly using a free Apple ID; that
+            signature expires after 7 days and must be refreshed.
+
+            **`CBCT-Viewer.ipa`** is signed with your developer account and can
+            be installed directly or pushed to TestFlight.
+
+            On iPhone use the **multi-file picker**, not "load folder" —
+            directory selection relies on `webkitdirectory`, which WKWebView
+            does not support.
+
+            ---
+            **Not a certified medical device.** This build has not been cleared
+            by the FDA, under EU MDR, or by any other regulator, and the quality
+            presets deliberately reduce image fidelity to fit constrained
+            hardware. Do not use it as the sole basis for diagnosis or treatment
+            planning.

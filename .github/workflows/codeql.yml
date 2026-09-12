@@ -12,10 +12,10 @@
 name: "CodeQL Advanced"
 
 on:
-  pull_request:
-    branches: [ "main" ]
-  schedule:
-    - cron: '15 1 * * 5'
+  # Fork note: upstream ran this on every PR to `main` and weekly on a cron.
+  # This fork's default branch is `master` and the schedule just burns CI
+  # minutes, so analysis is manual-only here.
+  workflow_dispatch:
 
 jobs:
   analyze:
