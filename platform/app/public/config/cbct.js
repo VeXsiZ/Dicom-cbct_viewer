@@ -102,6 +102,53 @@
 
   const PRESET_ORDER = ['low', 'medium', 'high', 'ultra'];
 
+  /**
+   * Window/level presets for dental CBCT.
+   *
+   * These are also registered with OHIF's own preset menu (see
+   * `cornerstone.windowLevelPresets` below), but that menu sits behind a
+   * toolbar button that is easy to miss on a narrow phone toolbar, so the same
+   * values are offered here as one-tap buttons.
+   */
+  const WL_PRESETS = [
+    { name: 'Bone', window: 2500, level: 500 },
+    { name: 'Teeth', window: 3500, level: 1400 },
+    { name: 'Soft tissue', window: 500, level: 60 },
+    { name: 'Airway', window: 1400, level: -400 },
+    { name: 'Full range', window: 4000, level: 900 },
+  ];
+
+  /**
+   * Apply a window/level to whichever viewport is active.
+   *
+   * `window.commandsManager` and `window.services` are set by the cornerstone
+   * extension during init, so they exist by the time the user can press a
+   * button. Failures are reported in the panel rather than thrown, because a
+   * missing viewport simply means nothing is loaded yet.
+   */
+  function applyWindowLevel(windowWidth, windowCenter) {
+    const commandsManager = window.commandsManager;
+    const services = window.services;
+    if (!commandsManager || !services || !services.viewportGridService) {
+      return 'Viewer not ready yet.';
+    }
+    const viewportId = services.viewportGridService.getState().activeViewportId;
+    if (!viewportId) {
+      return 'No active viewport.';
+    }
+    try {
+      commandsManager.runCommand('setViewportWindowLevel', {
+        viewportId: viewportId,
+        windowWidth: windowWidth,
+        windowCenter: windowCenter,
+      });
+      return null;
+    } catch (e) {
+      console.warn('[CBCT] window/level failed', e);
+      return 'Could not apply — is a study loaded?';
+    }
+  }
+
   // --- platform detection ----------------------------------------------------
   // Capacitor exposes window.Capacitor; Tauri exposes __TAURI__ / __TAURI_INTERNALS__.
   const isCapacitor = typeof window.Capacitor !== 'undefined';
@@ -338,6 +385,14 @@
       #cbct-quality-panel input { margin-right: 7px; accent-color: #4b90c8; }
       #cbct-quality-panel .foot { font-size: 10.5px; color: #7b90a5; margin-top: 10px;
         border-top: 1px solid #253748; padding-top: 9px; line-height: 1.5; }
+      #cbct-wl { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+      #cbct-wl .wl { display: flex; flex-direction: column; align-items: flex-start;
+        gap: 2px; background: #14293c; color: #dbe8f4; border: 1px solid #2b3d50;
+        border-radius: 7px; padding: 8px 9px; font-size: 12.5px; font-weight: 500;
+        cursor: pointer; text-align: left; font-family: inherit; }
+      #cbct-wl .wl:hover { border-color: #4b90c8; background: #17324a; }
+      #cbct-wl .wl span { font-size: 10px; color: #8fa6bc; font-weight: 400; }
+      #cbct-wl-msg { min-height: 14px; margin-top: 6px; }
     `;
 
     const button = document.createElement('button');
@@ -407,11 +462,34 @@
       'value range, and 8-bit textures can flatten it until everything looks the ' +
       'same shade of grey.</div>' +
       precisionRows +
+      '<h3 style="margin-top:14px">Window / level</h3>' +
+      '<div class="sub">Applies to the active viewport. If the scan looks like ' +
+      'flat grey, start with Bone.</div>' +
+      '<div id="cbct-wl">' +
+      WL_PRESETS.map(function (wl, i) {
+        return (
+          '<button type="button" class="wl" data-wl="' + i + '">' +
+          wl.name + '<span>W ' + wl.window + ' / L ' + wl.level + '</span></button>'
+        );
+      }).join('') +
+      '</div>' +
+      '<div id="cbct-wl-msg" class="hint"></div>' +
       '<div class="foot">Detected: ' + detectedText +
       '<br>Not a certified medical device. Do not use as the sole basis for diagnosis.</div>';
 
     button.addEventListener('click', function () {
       panel.classList.toggle('open');
+    });
+
+    panel.addEventListener('click', function (event) {
+      const target = event.target.closest ? event.target.closest('.wl') : null;
+      if (!target) return;
+      const wl = WL_PRESETS[Number(target.getAttribute('data-wl'))];
+      const message = applyWindowLevel(wl.window, wl.level);
+      const box = panel.querySelector('#cbct-wl-msg');
+      if (box) {
+        box.textContent = message || 'Applied ' + wl.name + '.';
+      }
     });
 
     panel.addEventListener('change', function (event) {
