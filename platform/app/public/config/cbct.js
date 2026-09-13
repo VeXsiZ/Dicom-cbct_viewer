@@ -29,6 +29,48 @@
  */
 
 (function () {
+  // --- error capture ---------------------------------------------------------
+  // A packaged webview has no devtools, so anything that fails during decoding
+  // would otherwise be invisible. Keep the last handful of errors so the
+  // diagnostics panel can show them on the device.
+  const capturedErrors = [];
+  function captureError(source, args) {
+    try {
+      const text = Array.prototype.map
+        .call(args, function (a) {
+          if (a instanceof Error) return a.message;
+          if (typeof a === 'object') {
+            try {
+              return JSON.stringify(a).slice(0, 200);
+            } catch (e) {
+              return String(a);
+            }
+          }
+          return String(a);
+        })
+        .join(' ')
+        .slice(0, 300);
+      if (text && capturedErrors.indexOf(text) === -1) {
+        capturedErrors.push(source + ': ' + text);
+        if (capturedErrors.length > 8) capturedErrors.shift();
+      }
+    } catch (e) {
+      // never let the logger break the app
+    }
+  }
+
+  const originalConsoleError = console.error.bind(console);
+  console.error = function () {
+    captureError('console', arguments);
+    originalConsoleError.apply(null, arguments);
+  };
+  window.addEventListener('error', function (e) {
+    captureError('error', [e.message]);
+  });
+  window.addEventListener('unhandledrejection', function (e) {
+    captureError('promise', [(e.reason && e.reason.message) || e.reason]);
+  });
+
   // --- landing route ---------------------------------------------------------
   // With `showStudyList: false` OHIF registers no route for `/`, so the app
   // would boot straight into its 404 page. The local file loader lives at
@@ -344,6 +386,119 @@
     ],
   };
 
+  /**
+   * Collect what is actually in the loaded data.
+   *
+   * The point of this is to separate "the pixels are uniform" from "windowing
+   * is wrong". If the scalar range comes back as a single value, no window
+   * setting will ever produce an image and the problem is upstream in
+   * decoding. The DICOM tags then say why — transfer syntax in particular,
+   * since a compressed syntax needs a WASM codec that may not be reachable
+   * inside a packaged webview.
+   */
+  function collectDiagnostics() {
+    const lines = [];
+    const services = window.services;
+
+    function add(label, value) {
+      if (value === undefined || value === null || value === '') return;
+      lines.push(label + ': ' + value);
+    }
+
+    if (!services) {
+      return ['Viewer not ready yet.'];
+    }
+
+    // --- DICOM tags from the loaded display set ---
+    try {
+      const displaySets = services.displaySetService.getActiveDisplaySets();
+      const ds = displaySets && displaySets[0];
+      const inst = ds && ds.instances && ds.instances[0];
+      if (inst) {
+        add('Modality', inst.Modality);
+        add('Transfer syntax', inst.TransferSyntaxUID || inst.AvailableTransferSyntaxUID);
+        add('SOP class', inst.SOPClassUID);
+        add('Size', (inst.Rows || '?') + ' x ' + (inst.Columns || '?'));
+        add('Bits alloc/stored', inst.BitsAllocated + '/' + inst.BitsStored);
+        add('Pixel repr', inst.PixelRepresentation);
+        add('Photometric', inst.PhotometricInterpretation);
+        add('Rescale slope/int', inst.RescaleSlope + ' / ' + inst.RescaleIntercept);
+        add('Frames', inst.NumberOfFrames);
+        add('Samples/px', inst.SamplesPerPixel);
+        add('Instances', ds.instances.length);
+        add('Window in file', inst.WindowWidth + ' / ' + inst.WindowCenter);
+      } else {
+        lines.push('No display set loaded.');
+      }
+    } catch (e) {
+      lines.push('Tag read failed: ' + e.message);
+    }
+
+    // --- actual voxel values in the rendered viewport ---
+    try {
+      const viewportId = services.viewportGridService.getState().activeViewportId;
+      const engine = services.cornerstoneViewportService.getRenderingEngine();
+      const viewport = engine && engine.getViewport(viewportId);
+      const imageData = viewport && viewport.getImageData && viewport.getImageData();
+
+      if (imageData) {
+        add('Dimensions', (imageData.dimensions || []).join(' x '));
+        add('Spacing', (imageData.spacing || []).map(function (n) {
+          return Number(n).toFixed(3);
+        }).join(', '));
+
+        let range = null;
+        if (imageData.imageData && imageData.imageData.getPointData) {
+          const scalars = imageData.imageData.getPointData().getScalars();
+          if (scalars && scalars.getRange) range = scalars.getRange();
+        }
+        if (!range && imageData.voxelManager && imageData.voxelManager.getRange) {
+          range = imageData.voxelManager.getRange();
+        }
+        if (!range && imageData.scalarData && imageData.scalarData.length) {
+          let min = Infinity;
+          let max = -Infinity;
+          const data = imageData.scalarData;
+          // Sample rather than walk a few hundred million voxels.
+          const stride = Math.max(1, Math.floor(data.length / 200000));
+          for (let i = 0; i < data.length; i += stride) {
+            const v = data[i];
+            if (v < min) min = v;
+            if (v > max) max = v;
+          }
+          range = [min, max];
+        }
+
+        if (range) {
+          add('VOXEL RANGE', range[0] + ' .. ' + range[1]);
+          if (range[0] === range[1]) {
+            lines.push('>> Data is uniform. Windowing cannot help.');
+          }
+        } else {
+          lines.push('Could not read voxel range.');
+        }
+
+        add('Data type', imageData.scalarData && imageData.scalarData.constructor.name);
+        if (imageData.preScale) {
+          add('Prescaled', String(imageData.preScale.scaled));
+        }
+      } else {
+        lines.push('No viewport image data.');
+      }
+    } catch (e) {
+      lines.push('Pixel read failed: ' + e.message);
+    }
+
+    if (capturedErrors.length) {
+      lines.push('--- errors ---');
+      capturedErrors.forEach(function (e) {
+        lines.push(e);
+      });
+    }
+
+    return lines;
+  }
+
   // --- in-app settings panel -------------------------------------------------
   // The packaged apps have no address bar, so URL parameters are not reachable.
   // This is a deliberately dependency-free overlay rather than an OHIF React
@@ -393,6 +548,13 @@
       #cbct-wl .wl:hover { border-color: #4b90c8; background: #17324a; }
       #cbct-wl .wl span { font-size: 10px; color: #8fa6bc; font-weight: 400; }
       #cbct-wl-msg { min-height: 14px; margin-top: 6px; }
+      #cbct-diag-out { display: none; white-space: pre-wrap; word-break: break-all;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        font-size: 10px; line-height: 1.5; color: #b9d0e4; background: #071522;
+        border: 1px solid #253748; border-radius: 6px; padding: 8px;
+        margin: 8px 0 0; max-height: 230px; overflow: auto; }
+      #cbct-diag-out.shown { display: block; }
+      #cbct-diag-copy { width: 100%; margin-top: 6px; }
     `;
 
     const button = document.createElement('button');
@@ -474,6 +636,10 @@
       }).join('') +
       '</div>' +
       '<div id="cbct-wl-msg" class="hint"></div>' +
+      '<h3 style="margin-top:14px">Diagnostics</h3>' +
+      '<div class="sub">Reads what is actually in the loaded data.</div>' +
+      '<button type="button" id="cbct-diag-run" class="wl" style="width:100%">Run diagnostics</button>' +
+      '<pre id="cbct-diag-out"></pre>' +
       '<div class="foot">Detected: ' + detectedText +
       '<br>Not a certified medical device. Do not use as the sole basis for diagnosis.</div>';
 
@@ -482,8 +648,37 @@
     });
 
     panel.addEventListener('click', function (event) {
+      if (event.target && event.target.id === 'cbct-diag-run') {
+        const out = panel.querySelector('#cbct-diag-out');
+        const report = collectDiagnostics();
+        out.textContent = report.join('\n');
+        out.classList.add('shown');
+
+        let copy = panel.querySelector('#cbct-diag-copy');
+        if (!copy) {
+          copy = document.createElement('button');
+          copy.type = 'button';
+          copy.id = 'cbct-diag-copy';
+          copy.className = 'wl';
+          copy.textContent = 'Copy report';
+          copy.addEventListener('click', function () {
+            const text = out.textContent;
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+              navigator.clipboard.writeText(text).then(
+                function () { copy.textContent = 'Copied'; },
+                function () { copy.textContent = 'Copy failed — select the text above'; }
+              );
+            } else {
+              copy.textContent = 'Select the text above to copy';
+            }
+          });
+          out.parentNode.insertBefore(copy, out.nextSibling);
+        }
+        return;
+      }
+
       const target = event.target.closest ? event.target.closest('.wl') : null;
-      if (!target) return;
+      if (!target || !target.hasAttribute('data-wl')) return;
       const wl = WL_PRESETS[Number(target.getAttribute('data-wl'))];
       const message = applyWindowLevel(wl.window, wl.level);
       const box = panel.querySelector('#cbct-wl-msg');
