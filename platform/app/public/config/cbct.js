@@ -61,8 +61,13 @@
 
   const originalConsoleError = console.error.bind(console);
   console.error = function () {
-    captureError('console', arguments);
+    captureError('error', arguments);
     originalConsoleError.apply(null, arguments);
+  };
+  const originalConsoleWarn = console.warn.bind(console);
+  console.warn = function () {
+    captureError('warn', arguments);
+    originalConsoleWarn.apply(null, arguments);
   };
   window.addEventListener('error', function (e) {
     captureError('error', [e.message]);
@@ -398,6 +403,7 @@
    */
   function collectDiagnostics() {
     const lines = [];
+    const verdicts = [];
     const services = window.services;
 
     function add(label, value) {
@@ -423,10 +429,20 @@
         add('Pixel repr', inst.PixelRepresentation);
         add('Photometric', inst.PhotometricInterpretation);
         add('Rescale slope/int', inst.RescaleSlope + ' / ' + inst.RescaleIntercept);
+        // A slope of 0 collapses every stored value onto the intercept, which
+        // renders as a single flat shade no matter what window is applied.
+        // Some CBCT exporters write this incorrectly.
+        if (Number(inst.RescaleSlope) === 0) {
+          verdicts.push('RescaleSlope is 0. Every pixel is forced to the ' +
+            'intercept value, which is why the image is flat.');
+        }
+        if (Number(inst.BitsStored) > Number(inst.BitsAllocated)) {
+          verdicts.push('BitsStored exceeds BitsAllocated — the header is inconsistent.');
+        }
         add('Frames', inst.NumberOfFrames);
         add('Samples/px', inst.SamplesPerPixel);
         add('Instances', ds.instances.length);
-        add('Window in file', inst.WindowWidth + ' / ' + inst.WindowCenter);
+        add('Window in file', (inst.WindowWidth === undefined && inst.WindowCenter === undefined) ? '' : (inst.WindowWidth + ' / ' + inst.WindowCenter));
       } else {
         lines.push('No display set loaded.');
       }
@@ -472,10 +488,32 @@
         if (range) {
           add('VOXEL RANGE', range[0] + ' .. ' + range[1]);
           if (range[0] === range[1]) {
-            lines.push('>> Data is uniform. Windowing cannot help.');
+            verdicts.push('Rendered data is uniform (' + range[0] + ' everywhere). ' +
+              'No window setting can produce an image from this.');
           }
         } else {
           lines.push('Could not read voxel range.');
+        }
+
+        // Sample across the middle row of the current slice. A range taken over
+        // the whole volume can hide a per-slice problem, and seeing the actual
+        // numbers distinguishes "all identical" from "varies but too little".
+        try {
+          const data = imageData.scalarData;
+          const dims = imageData.dimensions || [];
+          if (data && dims[0] && dims[1]) {
+            const sliceSize = dims[0] * dims[1];
+            const sliceIndex = Math.floor((dims[2] || 1) / 2);
+            const rowStart = sliceIndex * sliceSize + Math.floor(dims[1] / 2) * dims[0];
+            const samples = [];
+            for (let i = 0; i < 8; i++) {
+              const idx = rowStart + Math.floor((i * dims[0]) / 8);
+              if (idx < data.length) samples.push(data[idx]);
+            }
+            add('Mid-row samples', samples.join(', '));
+          }
+        } catch (e) {
+          lines.push('Sampling failed: ' + e.message);
         }
 
         add('Data type', imageData.scalarData && imageData.scalarData.constructor.name);
@@ -490,13 +528,80 @@
     }
 
     if (capturedErrors.length) {
-      lines.push('--- errors ---');
+      lines.push('--- log ---');
       capturedErrors.forEach(function (e) {
         lines.push(e);
       });
     }
 
+    if (verdicts.length) {
+      lines.unshift('');
+      verdicts
+        .slice()
+        .reverse()
+        .forEach(function (v) {
+          lines.unshift('>> ' + v);
+        });
+    }
+
     return lines;
+  }
+
+  /**
+   * Run the diagnostics once shortly after a study renders and, if something is
+   * clearly wrong, say so without waiting for the user to go looking for the
+   * button.
+   */
+  function autoDiagnose() {
+    let attempts = 0;
+    const timer = setInterval(function () {
+      attempts += 1;
+      if (attempts > 20) {
+        clearInterval(timer);
+        return;
+      }
+      let report;
+      try {
+        report = collectDiagnostics();
+      } catch (e) {
+        return;
+      }
+      const hasData = report.some(function (l) {
+        return l.indexOf('VOXEL RANGE') === 0;
+      });
+      if (!hasData) return;
+      clearInterval(timer);
+
+      const problems = report.filter(function (l) {
+        return l.indexOf('>>') === 0;
+      });
+      console.log('[CBCT] diagnostics\n' + report.join('\n'));
+      if (problems.length) {
+        showBanner(problems.join('  '));
+      }
+    }, 1500);
+  }
+
+  function showBanner(text) {
+    if (document.getElementById('cbct-banner')) return;
+    const bar = document.createElement('div');
+    bar.id = 'cbct-banner';
+    bar.style.cssText =
+      'position:fixed;left:10px;right:66px;bottom:14px;z-index:2147482000;' +
+      'background:#3a1d1d;color:#ffd9d9;border:1px solid #7a3b3b;border-radius:8px;' +
+      'padding:9px 11px;font:12px/1.45 system-ui,-apple-system,sans-serif;' +
+      'box-shadow:0 3px 14px rgba(0,0,0,.5);';
+    bar.textContent = text + '  (gear -> Diagnostics for the full report)';
+    const close = document.createElement('button');
+    close.textContent = '\u00d7';
+    close.style.cssText =
+      'float:right;margin-left:8px;background:none;border:none;color:#ffd9d9;' +
+      'font-size:16px;line-height:1;cursor:pointer;';
+    close.addEventListener('click', function () {
+      bar.remove();
+    });
+    bar.insertBefore(close, bar.firstChild);
+    document.body.appendChild(bar);
   }
 
   // --- in-app settings panel -------------------------------------------------
@@ -709,6 +814,8 @@
     root.appendChild(button);
     root.appendChild(panel);
     document.body.appendChild(root);
+
+    autoDiagnose();
   }
 
   if (document.readyState === 'loading') {
