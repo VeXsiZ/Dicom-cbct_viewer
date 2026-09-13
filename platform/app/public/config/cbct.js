@@ -90,6 +90,36 @@
 
   const STORAGE_KEY = 'cbct-viewer:quality';
   const PRECISION_KEY = 'cbct-viewer:force16bit';
+  const RENDERER_KEY = 'cbct-viewer:renderer';
+
+  /**
+   * Does this GPU support linear filtering of floating-point textures?
+   *
+   * Cornerstone uploads CT/CBCT pixel data as float textures and relies on the
+   * GPU filtering them. Plenty of mobile GPUs expose WebGL but not
+   * OES_texture_float_linear, and when that extension is missing the sampler
+   * returns a constant instead of failing loudly — the viewport renders as one
+   * flat shade that still responds to window/level exactly as a real image
+   * would. The pixel data is fine in that case; only the GPU path is broken.
+   *
+   * Returns null when we cannot tell (no WebGL context at all).
+   */
+  function gpuSupportsFloatLinear() {
+    try {
+      const canvas = document.createElement('canvas');
+      const gl =
+        canvas.getContext('webgl2') ||
+        canvas.getContext('webgl') ||
+        canvas.getContext('experimental-webgl');
+      if (!gl) return null;
+      const supported = !!gl.getExtension('OES_texture_float_linear');
+      const lose = gl.getExtension('WEBGL_lose_context');
+      if (lose) lose.loseContext();
+      return supported;
+    } catch (e) {
+      return null;
+    }
+  }
   const MB = 1024 * 1024;
 
   /**
@@ -276,6 +306,25 @@
   const preferSizeOverAccuracy =
     force16Bit === null ? preset.preferSizeOverAccuracy : !force16Bit;
 
+  // Renderer selection. Auto falls back to CPU when the GPU cannot filter float
+  // textures, because on those devices the GPU path renders nothing usable.
+  const floatLinearSupported = gpuSupportsFloatLinear();
+
+  function readRendererChoice() {
+    try {
+      const stored = window.localStorage.getItem(RENDERER_KEY);
+      if (stored === 'gpu' || stored === 'cpu' || stored === 'auto') return stored;
+    } catch (e) {
+      // localStorage may be unavailable in a restricted webview.
+    }
+    return 'auto';
+  }
+
+  const rendererChoice = readRendererChoice();
+  const useCPURendering =
+    rendererChoice === 'cpu' ||
+    (rendererChoice === 'auto' && floatLinearSupported === false);
+
   // Expose for the settings UI and for troubleshooting from a console.
   window.cbctQuality = {
     storageKey: STORAGE_KEY,
@@ -285,6 +334,9 @@
     resolved: resolvedKey,
     force16Bit: force16Bit,
     preferSizeOverAccuracy: preferSizeOverAccuracy,
+    rendererChoice: rendererChoice,
+    useCPURendering: useCPURendering,
+    floatLinearSupported: floatLinearSupported,
     isMobileDevice: isMobileDevice,
     isPackaged: isPackaged,
     platform: isCapacitor ? 'capacitor' : isTauri ? 'tauri' : 'browser',
@@ -297,6 +349,14 @@
         window.localStorage.setItem(STORAGE_KEY, value);
       } catch (e) {
         console.warn('Could not persist quality choice', e);
+      }
+      window.location.reload();
+    },
+    setRenderer: function (value) {
+      try {
+        window.localStorage.setItem(RENDERER_KEY, value);
+      } catch (e) {
+        console.warn('Could not persist renderer choice', e);
       }
       window.location.reload();
     },
@@ -362,6 +422,7 @@
       webGlContextCount: preset.webGlContextCount,
     },
     isMobile: isMobileDevice,
+    useCPURendering: useCPURendering,
     maxCacheSize: preset.maxCacheSize,
     maxNumberOfWebWorkers: preset.maxNumberOfWebWorkers,
     maxNumRequests: {
@@ -718,8 +779,40 @@
       })
       .join('');
 
+    const rendererRows = [
+      [
+        'auto',
+        'Automatic',
+        floatLinearSupported === false
+          ? 'This GPU cannot filter float textures, so CPU is used.'
+          : 'GPU where supported.',
+      ],
+      ['gpu', 'GPU', 'Fast, and required for 3D volume rendering.'],
+      [
+        'cpu',
+        'CPU (compatibility)',
+        'Slower, 2D slices only, but works where the GPU path renders blank.',
+      ],
+    ]
+      .map(function (row) {
+        const active = row[0] === rendererChoice ? ' active' : '';
+        const checked = row[0] === rendererChoice ? ' checked' : '';
+        return (
+          '<label class="' + active.trim() + '">' +
+          '<div class="name"><input type="radio" name="cbct-r" value="' + row[0] + '"' +
+          checked + '>' + row[1] + '</div>' +
+          '<div class="hint">' + row[2] + '</div>' +
+          '</label>'
+        );
+      })
+      .join('');
+
     panel.innerHTML =
-      '<h3>Rendering quality</h3>' +
+      '<h3>Renderer</h3>' +
+      '<div class="sub">If the scan loads but shows as one flat shade, switch to ' +
+      'CPU. That means the GPU cannot filter the image textures.</div>' +
+      rendererRows +
+      '<h3 style="margin-top:14px">Rendering quality</h3>' +
       '<div class="sub">Lower settings use less memory and render faster. ' +
       'Higher settings are sharper but can fail on devices with limited GPU memory. ' +
       'Changing this reloads the viewer.</div>' +
@@ -796,6 +889,9 @@
       const target = event.target;
       if (target && target.name === 'cbct-q') {
         window.cbctQuality.set(target.value);
+      }
+      if (target && target.name === 'cbct-r') {
+        window.cbctQuality.setRenderer(target.value);
       }
       if (target && target.name === 'cbct-p') {
         window.cbctQuality.setForce16Bit(
